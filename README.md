@@ -111,6 +111,7 @@ gffread WS279_Wormbase_coding.gff3 -T -o WS279_Wormbase_coding.gtf
 ```
 </details>
 
+
 ```bash  
 # rDNA indexing for Bowtie
 bowtie-build Elegans_rRNA.fa ./Elegans_indices/Elegans_rRNA  

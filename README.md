@@ -117,7 +117,7 @@ gffread WS279_Wormbase_coding.gff3 -T -o WS279_Wormbase_coding.gtf
 # rDNA indexing for Bowtie
 bowtie-build Elegans_rRNA.fa ./Elegans_indices/Elegans_rRNA  
 # Genome indexing for STAR
-STAR --runThreadN 40 --runMode genomeGenerate --genomeDir ./Elegans_index/ --genomeFastaFiles ./c_elegans.PRJNA13758.WS268.genomic.fa --sjdbGTFfile ./WS268_Wormbase_coding.gtf
+STAR --runThreadN 40 --runMode genomeGenerate --genomeDir ./Elegans_index/ --genomeFastaFiles ./c_elegans.PRJNA13758.WS279.genomic.fa --sjdbGTFfile ./WS279_Wormbase_coding.gtf
 ```
 </details>
 

@@ -154,11 +154,15 @@ STAR --genomeLoad Remove 	# remove loaded genome from shared memory
 for dir in */; do 
 echo "$(STAR --runThreadN 40 --outSAMtype BAM Unsorted --outSAMmultNmax 1 --quantMode GeneCounts --genomeLoad LoadAndKeep --genomeDir STAR-2.7.2b/Elegans_index/ --readFilesCommand gunzip -c --readFilesIn "$dir""trimmed_1.fq.gz" "$dir""trimmed_2.fq.gz" --outFileNamePrefix ./"$dir")"; 
 done
-
 #rename generic file names
 for dir in */; do
 basename="${dir%/}";
 mv "$dir"ReadsPerGene.out.tab "$dir""$basename".counts
+done
+#copy files in the same directory for easier transfer
+for dir in */; do
+basename="${dir%/}";
+cp "$dir""$basename".counts ./;
 done
 ```
 </details>

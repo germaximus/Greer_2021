@@ -144,10 +144,21 @@ done
 <details><summary><b>Read mapping and counting with STAR</b></summary>
      
 ```bash
-STAR --genomeLoad LoadAndExit --genomeDir ../STAR-2.6.1d/Elegans_index/ 	# load genome once in the shared memory
-STAR --runThreadN 40 --outSAMtype BAM Unsorted --outSAMmultNmax 1 --quantMode GeneCounts --genomeLoad LoadAndKeep --genomeDir ../STAR-2.6.1d/Elegans_index/ --readFilesCommand gunzip -c --readFilesIn trimmed_1.fastq trimmed_2.fastq --outFileNamePrefix ./OUT_folder/ 
+STAR --genomeLoad LoadAndExit --genomeDir ../STAR-2.7.2b/Elegans_index/ 	# load genome once in the shared memory
+STAR --runThreadN 40 --outSAMtype BAM Unsorted --outSAMmultNmax 1 --quantMode GeneCounts --genomeLoad LoadAndKeep --genomeDir ../STAR-2.7.2b/Elegans_index/ --readFilesCommand gunzip -c --readFilesIn trimmed_1.fastq trimmed_2.fastq --outFileNamePrefix ./OUT_folder/ 
 STAR --genomeLoad Remove 	# remove loaded genome from shared memory
 # ipcs - check shared memory consumption
 # ipcrm - remove object from shared memory
+
+#automate with a loop
+for dir in */; do 
+echo "$(STAR --runThreadN 40 --outSAMtype BAM Unsorted --outSAMmultNmax 1 --quantMode GeneCounts --genomeLoad LoadAndKeep --genomeDir STAR-2.7.2b/Elegans_index/ --readFilesCommand gunzip -c --readFilesIn "$dir""trimmed_1.fq.gz" "$dir""trimmed_2.fq.gz" --outFileNamePrefix ./"$dir")"; 
+done
+
+#rename generic file names
+for dir in */; do
+basename="${dir%/}";
+mv "$dir"ReadsPerGene.out.tab "$dir""$basename".counts
+done
 ```
 </details>

@@ -170,7 +170,8 @@ done
 
 <details><summary><b>Transcriptome analysis, DE genes</b></summary>
 
+R notebook knitted/source with differential gene expression analysis: ```Analysis.html```, ```Analysis.Rmd```, ```Analysis.nb.html```   
+Hi-res Rank Rank Hypergeometric Maps comparing gene expression similarities between two experiments are in the ```Analysis.html```  
 
-     
 </details>
 

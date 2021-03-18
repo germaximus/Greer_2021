@@ -166,3 +166,11 @@ cp "$dir""$basename".counts ./;
 done
 ```
 </details>
+
+
+<details><summary><b>Transcriptome analysis, DE genes</b></summary>
+
+
+     
+</details>
+

@@ -175,3 +175,22 @@ Hi-res Rank Rank Hypergeometric Maps comparing gene expression similarities betw
 
 </details>
 
+### Ribo-seq sequencing reads filtering and mapping   
+Ribo-seq libraries are short and do not require the paired read. Here, I only use forward reads.  
+<details><summary><b>Illumina adapter trimming.</b></summary>
+
+```bash
+cutadapt -j 20 -m 23 -a AGATCGGAAGAGCACACGTCT --discard-untrimmed -o trimmed.fq.gz read.fq.gz
+# -j      - number of threads
+# -m      - discard the read if it is shorter than 23 nucleotides after adapter trimming
+# -M      - discard the read if it is longer than 35 nucleotides after adapter trimming
+# -u      - trim 1 nucleotide from 5` end
+
+#automate with bash for loop if needed. In the folder containing sample subfolders run this:
+for dir in */; do
+file=$(find "$dir" -name "*_1.fq.gz");
+echo "$(cutadapt -j 20 -m 23 -a AGATCGGAAGAGCACACGTCT --discard-untrimmed -o "$dir""trimmed.fastq.gz" "$file")";
+done
+```
+</details>
+

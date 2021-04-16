@@ -189,7 +189,7 @@ cutadapt -j 20 -m 23 -M 35 -u 1 -a AGATCGGAAGAGCACACGTCT --discard-untrimmed -o 
 #automate with bash for loop if needed. In the folder containing sample subfolders run this:
 for dir in */; do
 file=$(find "$dir" -name "*_1.fq.gz");
-echo "$(cutadapt -j 20 -m 23 -M 35 -u 1 -a AGATCGGAAGAGCACACGTCT --discard-untrimmed -o "$dir""trimmed.fastq.gz" "$file")";
+echo "$(cutadapt -j 20 -m 23 -M 40 -u 1 -a AGATCGGAAGAGCACACGTCT --discard-untrimmed -o "$dir""trimmed.fastq.gz" "$file")";
 done
 ```
 </details>

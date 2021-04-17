@@ -202,3 +202,17 @@ echo "$(bowtie -p 20 --un "$dir"filtered.fastq bowtie/Elegans_indices/Elegans_rR
 done
 ```
 </details>
+
+<details><summary><b>Read mapping and counting with STAR</b></summary>
+     
+```bash
+STAR --genomeLoad LoadAndExit --genomeDir ../STAR-2.7.2b/Elegans_index/ 	# load genome once in the shared memory
+
+for dir in */; do
+echo "$(STAR --runThreadN 40 --outSAMtype BAM Unsorted --outSAMmultNmax 1 --quantMode GeneCounts TranscriptomeSAM --genomeLoad LoadAndKeep --genomeDir STAR-2.7.2b/Elegans_index/ --readFilesIn "$dir"/filtered.fastq --outFileNamePrefix "$dir")";
+done
+
+STAR --genomeLoad Remove 	# remove loaded genome from shared memory
+# ipcs - check shared memory consumption
+# ipcrm - remove object from shared memory
+```

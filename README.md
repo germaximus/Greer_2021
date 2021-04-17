@@ -198,7 +198,7 @@ done
   
 ```bash
 for dir in */; do
-echo "$(bowtie -p 20 --un "$dir"filtered.fastq bowtie/Elegans_indices/Elegans_rRNA "$dir"trimmed.fastq.gz >/dev/null");
+echo "$(bowtie -p 20 --un "$dir"filtered.fastq bowtie/Elegans_indices/Elegans_rRNA "$dir"trimmed.fastq.gz >/dev/null)";
 done
 ```
 </details>

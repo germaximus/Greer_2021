@@ -1,0 +1,1532 @@
+---
+title: "Gene expression analysis, Greer 2021"
+output:
+  html_document:
+    theme: lumen
+    toc: yes
+    toc_float:
+      collapsed: false
+    toc_depth: '5'
+    df_print: paged
+  html_notebook:
+    theme: lumen
+    toc: yes
+    toc_float:
+      collapsed: false
+    toc_depth: 5
+---
+
+```{=html}
+<style type="text/css">
+.main-container {
+  max-width: 1200px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+```
+```{css, echo=FALSE}
+code {white-space:pre !important; overflow-x:auto}
+#TOC {
+  color: #011f4b;
+  min-width: 300px;
+  overflow:auto;
+}
+.tocify-item:hover {
+  font-weight: bold;
+}
+```
+
+```{r libraries, message=FALSE, warning=FALSE, include=FALSE}
+library(magrittr)
+library(DT)
+library(DESeq2)
+library(limma)
+library(clusterProfiler)
+library(org.Ce.eg.db)
+library(RColorBrewer)
+library(gplots)
+library(ggplot2)
+library(rstudioapi)
+library(dplyr)
+library(stringr)
+library(pheatmap)
+library(data.table)
+library(RRHO)
+library(gridExtra)
+library(dendextend)
+library(scales)
+```
+
+```{r custom functions, include=FALSE}
+# function to filter out genes that have less than 10 reads in at least 50% of samples 
+filter_by_count <- function(data) {
+  if(!is.matrix(data)) {stop('data is not a matrix')}
+  names <- colnames(data)
+  filtered <- apply(data, 1, function(x) {
+    passed <- x[x >= 10]
+    if (length(passed) > length(x)/2) { return(x)  }
+    else {return(rep(NA, length(x)))}    
+  }) %>% t() %>% .[complete.cases(.),] %>% set_colnames(names)
+  return(filtered)
+}
+
+# wrapper for DESeq2 results
+formatRes <- function(result) {
+  result <- result[order(result$padj),]
+  result <- as.data.frame(result)
+  result$rank <- -sign(result$log2FoldChange)*log10(result$pvalue)
+  result$geneName <- row.names(result)
+  return(result)
+}
+
+# plot RRHO maps
+rrhoMapPlot <- function(rrho, filename=NULL, plotTitle=NULL, scale=c(0,0), xlab=NULL, ylab=NULL, noFeatures=F, silent=F, blank=F) {
+  jet.colors <- colorRampPalette(c("#00007F", "blue", "#007FFF", "cyan", "#7FFF7F", "yellow", "#FF7F00", "red", "#7F0000"))
+  plotData <- reshape2::melt(rrho$hypermat.by)
+  p <- ggplot()
+  if (blank) { p <- p + geom_raster(data=plotData, aes(x=Var1, y=Var2), fill = "grey75") }
+  else       { p <- p + geom_raster(data=plotData, aes(x=Var1, y=Var2, fill=value)) }
+  
+  p <- p +
+    coord_fixed(expand=FALSE) +
+    theme_classic() +
+    theme(legend.position = "none") +
+    theme(axis.title=element_blank()) +
+    theme(axis.text=element_blank()) +
+    theme(axis.ticks=element_blank()) +
+    theme(axis.line = element_blank()) +
+    theme(plot.margin = margin(0, 0, 0, 0, "cm")) +
+    labs(title=NULL)
+  
+  if (!is.null(plotTitle)) { p <- p + labs(title=plotTitle)}
+  
+  if(isTRUE(noFeatures)) { p <- p + labs(fill="")}
+  else {
+    if (!is.null(xlab)) { p <- p + theme(axis.title.x = element_text()) + labs(x=xlab)}
+    if (!is.null(ylab)) { p <- p + theme(axis.title.y = element_text()) + labs(y=ylab)}
+  }
+  
+  if(all(scale == c(0,0))) { p <- p + scale_fill_gradientn(colours = jet.colors(9))       }
+  else { p <- p + scale_fill_gradientn(colours = jet.colors(9), limits=c(scale[1],scale[2]))  }
+  
+  if(!is.null(filename)) { ggsave(filename=filename, plot=p, device = 'png', width = 5, height = 5, dpi = 300, units = 'in')}
+  if(silent) { p }  else { print(p)}
+  
+}
+
+# function to filter out genes that have less than 10 reads in at least 50% of samples 
+filter_by_count <- function(data) {
+  if(!is.matrix(data)) {stop('data is not a matrix')}
+  names <- colnames(data)
+  filtered <- apply(data, 1, function(x) {
+    passed <- x[x >= 10]
+    if (length(passed) > length(x)/2) { return(x)  }
+    else {return(rep(NA, length(x)))}    
+  }) %>% t() %>% .[complete.cases(.),] %>% set_colnames(names)
+  mode(filtered) <- "integer"
+  return(filtered)
+}
+
+# limma often produce identical p-values for non-significant genes. GSEA does not like identical values. This function adds a very small value to the original p-value
+jitter_pval <- function(pvals){
+  jittered <- Reduce(f=function(a,b) {
+    if (b>a) {b}  else {b <- a + a/10**14}
+  }, x=pvals, accumulate=TRUE)
+  return(jittered)
+}
+
+```
+
+```{r, include=FALSE}
+# I accidentally left mitochondrial genome in the WS279_Wormbase_coding.gtf. Below is the list of mitochondrial genes that should be excluded from the analysis because they are not translated by cytoplasmic ribosomes.
+mtDNA <- c('WBGene00010957','WBGene00010958','WBGene00010959','WBGene00010960','WBGene00010961','WBGene00000829','WBGene00010962','WBGene00010963','WBGene00010964','WBGene00010965','WBGene00010966','WBGene00010967')
+# many histones are not polyadenylated (at least in this data set I checked and selected those with very high TE value)
+histones <- c('WBGene00001936','WBGene00001878','WBGene00001875','WBGene00001933','WBGene00001876','WBGene00001941','WBGene00001938','WBGene00001935','WBGene00001937','WBGene00001877','WBGene00001892','WBGene00001878')
+
+```
+
+
+
+# Transcriptome analysis    
+
+```{r load mRNA data}
+sampleTable <- read.table(file = "./counts/SampleTable.txt", header = TRUE, sep = "\t", stringsAsFactors = FALSE) 
+subtable <- sampleTable[sampleTable$type == "mrna" & sampleTable$study == 'greer',]
+mrnaCounts <- lapply(1:nrow(subtable), function(x) {
+                data <- read.table(file = paste0("./counts/",  subtable[x,"file"]), skip=4, row.names = 1) %>% select(1) %>% set_colnames(subtable[x,'abbr'])
+                data$geneNames <- row.names(data) %>% str_replace("Gene:","")
+                return(data)
+})
+mrnaCounts <- Reduce(function(df1, df2) {merge(df1, df2, by="geneNames", all=T)}, mrnaCounts)
+row.names(mrnaCounts) <- mrnaCounts$geneNames
+mrnaCounts$geneNames <- NULL
+mrnaCounts <- as.matrix(mrnaCounts)
+
+#mrnaCounts <- rlog(mrnaCounts)
+#write.csv(mrnaCounts, file="mRNAcounts.csv")
+```
+
+## Scatter plots  
+
+```{r, fig.align="center", fig.height=8, fig.width=8, dpi=300, warning=FALSE}
+png('./figures/MatrixPlot_mRNAseq.png', width = 2400, height = 2400, units = 'px', res = 300)
+pairs(mrnaCounts, log = "yx", pch = '.', gap = 0.25, xaxt = "n", yaxt = "n", labels = colnames(mrnaCounts))
+invisible(dev.off())
+pairs(mrnaCounts, log = "yx", pch = '.', gap = 0.25, xaxt = "n", yaxt = "n", labels = colnames(mrnaCounts))
+```
+
+
+## PCA plots  {.tabset .tabset-fade .tabset-pills}
+### Combined experiments  {.toc-ignore}
+
+```{r PCA plots, fig.align="center", fig.height=4, fig.width=4}
+# all mRNAseq samples together
+plotData <- filter_by_count(mrnaCounts) %>% rlog()
+plotData <- plotData[order(rowVars(plotData), decreasing = TRUE), ] %>% .[1:1000,]
+pca <- prcomp(t(plotData), scale. = TRUE)
+percentVar <- pca$sdev^2/sum(pca$sdev^2)
+PCAsummary <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], group = sampleTable[sampleTable$type == "mrna" & sampleTable$study == 'greer',"treatment"]) 
+
+g <- ggplot(data = PCAsummary, aes_string(x = "PC1", y = "PC2", color = "group")) + 
+        geom_point(size = 3) + 
+        xlab(paste0("PC1: ", round(percentVar[1] * 100), "% variance")) +
+        ylab(paste0("PC2: ", round(percentVar[2] * 100), "% variance")) +
+        theme_bw() +
+        theme(panel.grid = element_blank(), panel.border = element_rect(linetype = "solid", fill = NA, size = 0.75), plot.margin = margin(1,1,1,1,"mm")) +
+        theme(axis.ticks.length = unit(1, "mm"), axis.ticks = element_line(size = 0.5), axis.text = element_text(size = rel(0.75))) +
+        theme(axis.title = element_text(size = rel(0.75)))+
+        theme(legend.text = element_text(size = rel(0.65)), legend.title = element_blank(), legend.key.size = unit(15, "pt"), legend.margin = margin(0,0,0,0,"pt"), legend.box.margin=margin(0,0,0,-10, "pt"))
+
+ggsave(filename="./figures/PCA_mRNAseq.pdf", plot=g, device="pdf", units="in", width=4, height=4)
+g
+```
+
+### Fed-Starved  {.toc-ignore}
+
+```{r fig.align="center", fig.height=4, fig.width=4}
+# Fed-starved experiment
+plotData <- filter_by_count(mrnaCounts[,1:12]) %>% rlog()
+plotData <- plotData[order(rowVars(plotData), decreasing = TRUE), ] %>% .[1:1000,]
+pca <- prcomp(t(plotData), scale. = TRUE)
+percentVar <- pca$sdev^2/sum(pca$sdev^2)
+PCAsummary <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], group = sampleTable[sampleTable$type == 'mrna' &
+                                                                                 sampleTable$study == 'greer' &
+                                                                                 (sampleTable$treatment == 'Fed' | sampleTable$treatment == 'Starved'),
+                                                                                "treatment"])
+
+g <- ggplot(data = PCAsummary, aes_string(x = "PC1", y = "PC2", color = "group")) + 
+        geom_point(size = 3) + 
+        xlab(paste0("PC1: ", round(percentVar[1] * 100), "% variance")) +
+        ylab(paste0("PC2: ", round(percentVar[2] * 100), "% variance")) +
+        theme_bw() +
+        theme(panel.grid = element_blank(), panel.border = element_rect(linetype = "solid", fill = NA, size = 0.75), plot.margin = margin(1,1,1,1,"mm")) +
+        theme(axis.ticks.length = unit(1, "mm"), axis.ticks = element_line(size = 0.5), axis.text = element_text(size = rel(0.75))) +
+        theme(axis.title = element_text(size = rel(0.75)))+
+        theme(legend.text = element_text(size = rel(0.65)), legend.title = element_blank(), legend.key.size = unit(15, "pt"), legend.margin = margin(0,0,0,0,"pt"), legend.box.margin=margin(0,0,0,-10, "pt"))
+
+ggsave(filename="./figures/PCA_Fed-Starved_mRNAseq.pdf", plot=g, device="pdf", units="in", width=4, height=4)
+g
+```
+
+### Knockdowns  {.toc-ignore}
+
+```{r fig.align="center", fig.height=4, fig.width=4}
+
+# knockdowns experiment
+plotData <- filter_by_count(mrnaCounts[,13:ncol(mrnaCounts)]) %>% rlog()
+plotData <- plotData[order(rowVars(plotData), decreasing = TRUE), ] %>% .[1:1000,]
+pca <- prcomp(t(plotData), scale. = TRUE)
+percentVar <- pca$sdev^2/sum(pca$sdev^2)
+PCAsummary <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], group = sampleTable[sampleTable$type == 'mrna' &
+                                                                                 sampleTable$study == 'greer' &
+                                                                                 (sampleTable$treatment == 'RC27' | sampleTable$treatment == 'REV' | sampleTable$treatment == 'RE02'),
+                                                                                "treatment"])
+
+g <- ggplot(data = PCAsummary, aes_string(x = "PC1", y = "PC2", color = "group")) + 
+        geom_point(size = 3) + 
+        xlab(paste0("PC1: ", round(percentVar[1] * 100), "% variance")) +
+        ylab(paste0("PC2: ", round(percentVar[2] * 100), "% variance")) +
+        theme_bw() +
+        theme(panel.grid = element_blank(), panel.border = element_rect(linetype = "solid", fill = NA, size = 0.75), plot.margin = margin(1,1,1,1,"mm")) +
+        theme(axis.ticks.length = unit(1, "mm"), axis.ticks = element_line(size = 0.5), axis.text = element_text(size = rel(0.75))) +
+        theme(axis.title = element_text(size = rel(0.75)))+
+        theme(legend.text = element_text(size = rel(0.65)), legend.title = element_blank(), legend.key.size = unit(15, "pt"), legend.margin = margin(0,0,0,0,"pt"), legend.box.margin=margin(0,0,0,-10, "pt"))
+
+ggsave(filename="./figures/PCA_KDs_mRNAseq.pdf", plot=g, device="png", units="in", width=4, height=4)
+g
+
+```
+
+## {- .toc-ignore}
+
+## Differential Gene Expression Analysis
+Differential gene expression analysis for mRNA-seq experiments, preparation of ranked files for GSEA.  
+
+```{r DE analysis, warning=F, message=F}
+DEresults <- list()
+
+#-------------------------------------- Fed vs Starved -----------------------------------------------------------------
+colData <- data.frame(sample = colnames(mrnaCounts)[1:12],
+                      group = factor(c(rep("FE", 6), rep("ST", 6)), levels = c("FE","ST")),
+                      stringsAsFactors = FALSE
+)
+countData <- filter_by_count(mrnaCounts[,1:12])
+dds <- DESeqDataSetFromMatrix(countData = countData, colData = colData, design =~ group)
+dds <- DESeq(dds)
+#resultsNames(dds)
+result <-  results(dds, name = 'group_ST_vs_FE', cooksCutoff = FALSE, independentFiltering = FALSE) %>% formatRes()
+DEresults <- append(DEresults, list(STvsFE=result))
+write.csv(result, file="mRNAseq_Starved_vs_Fed.csv")
+
+#---------------------------------- Empty vector vs siRNA knockdowns -------------------------------------------------
+colData <- data.frame(sample = colnames(mrnaCounts)[13:ncol(mrnaCounts)],
+                      group = factor(c(rep("C27", 4), rep("EV", 4), rep("E02", 4)), levels = c("EV","E02","C27")),
+                      stringsAsFactors = FALSE
+)
+countData <- filter_by_count(mrnaCounts[,13:ncol(mrnaCounts)])
+dds <- DESeqDataSetFromMatrix(countData = countData, colData = colData, design =~ group)
+dds <- DESeq(dds)
+#resultsNames(dds)
+result <-  results(dds, name = 'group_E02_vs_EV', cooksCutoff = FALSE, independentFiltering = FALSE) %>% formatRes()
+DEresults <- append(DEresults, list(E02vsEV=result))
+write.csv(result, file="mRNAseq_E02_vs_EV.csv")
+result <-  results(dds, name = 'group_C27_vs_EV', cooksCutoff = FALSE, independentFiltering = FALSE) %>% formatRes()
+DEresults <- append(DEresults, list(C27vsEV=result))
+write.csv(result, file="mRNAseq_C27_vs_EV.csv")
+
+#save rank files
+junk <- lapply(names(DEresults), function(name) {
+  rank <- DEresults[[name]][, c('geneName', 'rank')] %>% setNames(c('NAME','RANK'))
+  rank <- rank[order(rank$RANK),]
+  write.table(rank, file=paste0("./ranked_files/", name, "mRNA.rnk"), row.names = F, quote = F, sep = "\t") 
+})
+rm(junk)
+```
+
+## Genes Heatmap  {.tabset .tabset-fade .tabset-pills}
+### Combined experiments  {.toc-ignore}
+Only genes that have significant differential expression (p.adj <= 0.05) in at least one condition are displayed on the heatmap (7352 genes).  
+
+```{r, fig.align="center", fig.height=4, fig.width=4}
+colors <- colorRampPalette(c("blue","black","yellow"))(256)
+plotData <- log10(mrnaCounts + 1)
+# keep only genes that are significantly DE in at least one condition
+genes2keep <- c()
+for (comparison in names(DEresults)) {
+  df <- DEresults[[comparison]]
+  DE_genes <- df[df$padj <= 0.05,] %>% row.names()
+  genes2keep <- union(genes2keep, DE_genes)
+}
+
+plotData <- plotData[genes2keep,]
+plotData <- plotData[!(row.names(plotData) %in% mtDNA),]
+plotData <- plotData[!(row.names(plotData) %in% histones),]
+plotData <- scale(plotData)
+distCol <- t(plotData) %>% dist()
+hclustCol <- hclust(distCol, method = 'complete') %>% rotate(., order = colnames(plotData))
+
+p <- pheatmap(plotData, clustering_distance_rows = 'correlation', clustering_method = "average", scale = 'row', cluster_cols = hclustCol,
+               color = colors,  border_color = NA, show_rownames = FALSE, fontsize = 8, silent = TRUE
+           
+)
+
+png(filename="./figures/mRNAseq_heatmap.png", res = 300, height = 4, width = 4, units = 'in')
+p
+invisible(dev.off())
+
+grid.arrange(p$gtable, newpage = T)
+
+```
+
+### Fed-Starved  {.toc-ignore .tabset .tabset-fade .tabset-pills}
+#### Diff expr genes only  {.toc-ignore}
+3159 genes  
+```{r, fig.align="center", fig.height=4, fig.width=4}
+colors <- colorRampPalette(c("blue","black","yellow"))(256)
+plotData <- log10(filter_by_count(mrnaCounts[,1:12]) + 1)
+#keep only genes that are significantly DE 
+df <- DEresults$STvsFE
+genes2keep <- df[df$padj <= 0.05,] %>% row.names()
+plotData <- plotData[genes2keep,]
+plotData <- plotData[!(row.names(plotData) %in% mtDNA),]
+plotData <- plotData[!(row.names(plotData) %in% histones),]
+plotData <- scale(plotData)
+distCol <- t(plotData) %>% dist()
+hclustCol <- hclust(distCol, method = 'complete') %>% rotate(., order = colnames(plotData))
+
+p <- pheatmap(plotData, clustering_distance_rows = 'correlation', clustering_method = "average", scale = 'row', cluster_cols = hclustCol,
+               color = colors,  border_color = NA, show_rownames = FALSE, fontsize = 8, silent = TRUE
+           
+)
+
+png(filename="./figures/mRNAseq_heatmap_Fed-Starved_DEgenes.png", res = 300, height = 4, width = 4, units = 'in')
+p
+invisible(dev.off())
+
+grid.arrange(p$gtable, newpage = T)
+```
+
+#### All genes {.toc-ignore}
+
+```{r, fig.align="center", fig.height=4, fig.width=4}
+colors <- colorRampPalette(c("blue","black","yellow"))(256)
+plotData <- log10(filter_by_count(mrnaCounts[,1:12]) + 1)
+plotData <- plotData[!(row.names(plotData) %in% mtDNA),]
+plotData <- plotData[!(row.names(plotData) %in% histones),]
+plotData <- scale(plotData)
+distCol <- t(plotData) %>% dist()
+hclustCol <- hclust(distCol, method = 'complete') %>% rotate(., order = colnames(plotData))
+
+p <- pheatmap(plotData, clustering_distance_rows = 'correlation', clustering_method = "average", scale = 'row', cluster_cols = hclustCol,
+               color = colors,  border_color = NA, show_rownames = FALSE, fontsize = 8, silent = TRUE
+           
+)
+
+png(filename="./figures/mRNAseq_heatmap_Fed-Starved_allGenes.png", res = 300, height = 4, width = 4, units = 'in')
+p
+invisible(dev.off())
+
+grid.arrange(p$gtable, newpage = T)
+```
+
+### {- .toc-ignore}
+### Knockdowns  {.toc-ignore .tabset .tabset-fade .tabset-pills}
+#### Diff expr genes only  {.toc-ignore}
+5764 genes  
+```{r, fig.align="center", fig.height=4, fig.width=4}
+colors <- colorRampPalette(c("blue","black","yellow"))(256)
+plotData <- log10(filter_by_count(mrnaCounts[,13:ncol(mrnaCounts)]) + 1)
+#keep only genes that are significantly DE
+genes2keep <- c()
+for (comparison in names(DEresults)[2:3]) {
+  df <- DEresults[[comparison]]
+  DE_genes <- df[df$padj <= 0.05,] %>% row.names()
+  genes2keep <- union(genes2keep, DE_genes)
+}
+
+plotData <- plotData[genes2keep,]
+plotData <- plotData[!(row.names(plotData) %in% mtDNA),]
+plotData <- plotData[!(row.names(plotData) %in% histones),]
+plotData <- scale(plotData)
+distCol <- t(plotData) %>% dist()
+hclustCol <- hclust(distCol, method = 'complete') %>% rotate(., order = colnames(plotData))
+
+p <- pheatmap(plotData, clustering_distance_rows = 'correlation', clustering_method = "average", scale = 'row', cluster_cols = hclustCol,
+               color = colors,  border_color = NA, show_rownames = FALSE, fontsize = 8, silent = TRUE
+           
+)
+
+png(filename="./figures/mRNAseq_heatmap_Knockdowns_DEgenes.png", res = 300, height = 4, width = 4, units = 'in')
+p
+invisible(dev.off())
+
+grid.arrange(p$gtable, newpage = T)
+
+```
+
+#### All genes {.toc-ignore}
+
+```{r, fig.align="center", fig.height=4, fig.width=4}
+colors <- colorRampPalette(c("blue","black","yellow"))(256)
+plotData <- log10(filter_by_count(mrnaCounts[,13:ncol(mrnaCounts)]) + 1)
+plotData <- plotData[!(row.names(plotData) %in% mtDNA),]
+plotData <- plotData[!(row.names(plotData) %in% histones),]
+plotData <- scale(plotData)
+distCol <- t(plotData) %>% dist()
+hclustCol <- hclust(distCol, method = 'complete') %>% rotate(., order = colnames(plotData))
+
+p <- pheatmap(plotData, clustering_distance_rows = 'correlation', clustering_method = "average", scale = 'row', cluster_cols = hclustCol,
+               color = colors,  border_color = NA, show_rownames = FALSE, fontsize = 8, silent = TRUE
+           
+)
+
+png(filename="./figures/mRNAseq_heatmap_Knockdowns_allGenes.png", res = 300, height = 4, width = 4, units = 'in')
+p
+invisible(dev.off())
+
+grid.arrange(p$gtable, newpage = T)
+
+```
+
+### {- .toc-ignore}
+## {- .toc-ignore}
+
+## RRHO maps
+RRHO maps based on mRNA-seq data
+
+```{r rrho maps, cache=TRUE}
+# load data
+rankFiles <- c("C27vsEVmRNA.rnk","E02vsEVmRNA.rnk", "STvsFEmRNA.rnk")
+ranklist <- lapply(rankFiles, function(file) {
+  data <- read.table(file = paste0("./ranked_files/", file), skip = 1, stringsAsFactors = FALSE) %>% set_colnames(c("geneName", str_sub(file, 0, -9)))
+})
+ranklist <- Reduce(function(df1, df2) {merge(df1, df2, by="geneName", all=T)}, ranklist)
+ranklist <- ranklist[complete.cases(ranklist),]
+
+rrhoMaps <- lapply(2:ncol(ranklist), function(i) {
+  output <- lapply(2:ncol(ranklist), function(j)  {
+    x.list <- ranklist[,c("geneName",colnames(ranklist)[i])]  
+    y.list <- ranklist[,c("geneName",colnames(ranklist)[j])]
+    map <- RRHO(list1=x.list, list2=y.list, stepsize = 50, plots=F, BY=T, log10.ind=T, alternative="two.sided")
+  })  %>% set_names(colnames(ranklist)[2:ncol(ranklist)])
+}) %>% set_names(colnames(ranklist)[2:ncol(ranklist)])
+
+rrhoMap_scale <- c(0,0)
+for(i in 1:length(rrhoMaps)){
+  for(j in 1:length(rrhoMaps[[i]])){
+    scale_max <- max(rrhoMaps[[i]][[j]]$hypermat.by[is.finite(rrhoMaps[[i]][[j]]$hypermat.by)], na.rm=T)
+    scale_min <- min(rrhoMaps[[i]][[j]]$hypermat.by[is.finite(rrhoMaps[[i]][[j]]$hypermat.by)], na.rm=T)
+    if(scale_max > rrhoMap_scale[2]) { rrhoMap_scale[2]=scale_max }
+    if(scale_min < rrhoMap_scale[1]) { rrhoMap_scale[1]=scale_min }
+  }
+}
+
+dopePlots <- lapply(1:length(rrhoMaps), function(i) {
+  output <- lapply(1:length(rrhoMaps[[i]]), function(j){
+    rrho <- rrhoMaps[[i]][[j]]
+    x.name <- names(rrhoMaps)[i]
+    y.name <- names(rrhoMaps[[i]])[j]
+    if(i == j) {
+      plot <- rrhoMapPlot(rrho=rrho, filename=paste0("./figures/RRHO_maps_mRNAseq/",x.name,"_vs_",y.name,".png"),
+                          noFeatures=T, blank=T, silent=T)      
+    }
+    else {
+      plot <- rrhoMapPlot(rrho=rrho, filename=paste0("./figures/RRHO_maps_mRNAseq/",x.name,"_vs_",y.name,".png"),
+                          noFeatures=T, silent=T)    
+    }
+  }) %>% set_names(names(rrhoMaps[[i]]))
+}) %>% set_names(names(rrhoMaps))
+
+png(filename = "./figures/RRHO_maps_mRNAseq/rrho_matrix.png", width = 10, height = 10, units="in", res = 300)
+grid.newpage()
+panels <- arrangeGrob(grobs = unlist(dopePlots, recursive = F), ncol=3, padding=0, respect = T)
+row_lab <- tableGrob(names(dopePlots), theme= ttheme_minimal(core = list(fg_params=list(rot=90))))
+col_lab <- tableGrob(t(c("",names(dopePlots))), theme= ttheme_minimal())
+combined <- gtable_cbind(row_lab, panels, size="last")
+combined <- gtable_rbind(col_lab, combined, size="last")
+grid.draw(combined)
+invisible(dev.off())
+```
+
+Selected RRHO maps, color intensities are on the same scale
+
+```{r, fig.height=3, fig.width=6, dpi=300}
+# selected RRHO
+rrhoMap_scale <- c(0,0)
+for(name in names(rrhoMaps$STvsFE)[1:2]){
+  scale_max <- max(rrhoMaps$STvsFE[[name]]$hypermat.by[is.finite(rrhoMaps$STvsFE[[name]]$hypermat.by)], na.rm=T)
+  scale_min <- min(rrhoMaps$STvsFE[[name]]$hypermat.by[is.finite(rrhoMaps$STvsFE[[name]]$hypermat.by)], na.rm=T)
+  if(scale_max > rrhoMap_scale[2]) { rrhoMap_scale[2]=scale_max }
+  if(scale_min < rrhoMap_scale[1]) { rrhoMap_scale[1]=scale_min }
+}
+
+plots <- lapply(names(rrhoMaps$STvsFE)[1:2], function(name) {
+    rrho <- rrhoMaps$STvsFE[[name]]
+    x.name <- "Starved     <=>       Fed"
+    y.name <- name %>% strsplit("vs") %>% unlist() %>% paste0(collapse='    <=>    ')
+    y.name <- strsplit(y.name, "vs")
+    plot <- rrhoMapPlot(rrho=rrho, scale = rrhoMap_scale, noFeatures=F, silent=T, xlab=x.name, ylab= y.name)    
+    
+}) %>% set_names(names(rrhoMaps$STvsFE)[1:2])
+
+png(filename = "./figures/RRHO_maps_mRNAseq/rrho_KDs_sameScale.png", width = 4, height = 2, units="in", res = 300)
+grid.arrange(grobs=plots, ncol=2, nrow=1)
+invisible(dev.off())
+
+grid.arrange(grobs=plots, ncol=2, nrow=1)
+
+```
+
+Selected RRHO maps, each panel has its own scale of color intensities
+
+```{r, fig.height=3, fig.width=6, dpi=300}
+plots <- lapply(names(rrhoMaps$STvsFE)[1:2], function(name) {
+    rrho <- rrhoMaps$STvsFE[[name]]
+    x.name <- "Starved     <=>       Fed"
+    y.name <- name %>% strsplit("vs") %>% unlist() %>% paste0(collapse='    <=>    ')
+    y.name <- strsplit(y.name, "vs")
+    plot <- rrhoMapPlot(rrho=rrho, noFeatures=F, silent=T, xlab=x.name, ylab= y.name)    
+    
+}) %>% set_names(names(rrhoMaps$STvsFE)[1:2])
+
+png(filename = "./figures/RRHO_maps_mRNAseq/rrho_KDs.png", width = 4, height = 2, units="in", res = 300)
+grid.arrange(grobs=plots, ncol=2, nrow=1)
+invisible(dev.off())
+
+grid.arrange(grobs=plots, ncol=2, nrow=1)
+```
+
+## Comparing to other studies
+
+Sural et. al. 2019. HSF-1 overexpression
+
+```{r Sural2019, include=FALSE}
+# loading mRNAseq count data
+subtable <- sampleTable[sampleTable$type == "mrna" & sampleTable$study == 'sural2019' & sampleTable$treatment != 'HSF_OE',]
+mrnaCounts_hsfOE <- lapply(1:nrow(subtable), function(x) {
+                data <- read.table(file = paste0("./counts/",  subtable[x,"file"]), skip=4, row.names = 1) %>% select(1) %>% set_colnames(subtable[x,'abbr'])
+                data$geneNames <- row.names(data) %>% str_replace("Gene:","")
+                return(data)
+})
+mrnaCounts_hsfOE <- Reduce(function(df1, df2) {merge(df1, df2, by="geneNames", all=T)}, mrnaCounts_hsfOE)
+row.names(mrnaCounts_hsfOE) <- mrnaCounts_hsfOE$geneNames
+mrnaCounts_hsfOE$geneNames <- NULL
+mrnaCounts_hsfOE <- as.matrix(mrnaCounts_hsfOE)
+
+# Differential gene expression analysis
+#---------------------------------- HSF-1 overexpression -------------------------------------------------
+colData <- data.frame(sample = colnames(mrnaCounts_hsfOE),
+                      group = factor(c(rep("overexp", 3), rep("control", 3)), levels = c("control","overexp")),
+                      stringsAsFactors = FALSE
+)
+countData <- filter_by_count(mrnaCounts_hsfOE)
+dds <- DESeqDataSetFromMatrix(countData = countData, colData = colData, design =~ group)
+dds <- DESeq(dds)
+result <-  results(dds, name = 'group_overexp_vs_control', cooksCutoff = FALSE, independentFiltering = FALSE) %>% formatRes()
+write.csv(result, file="mRNAseq_hsf1OE_overexp_vs_control.csv")
+rank <- result[, c('geneName', 'rank')] %>% setNames(c('NAME','RANK'))
+rank <- rank[order(rank$RANK),]
+write.table(rank, file=paste0("./ranked_files/", 'hsf_overexpr_vs_control', "_mRNA.rnk"), row.names = F, quote = F, sep = "\t") 
+
+# combine ranked files from different studies together
+rankFiles <- c("C27vsEVmRNA.rnk","E02vsEVmRNA.rnk", "STvsFEmRNA.rnk","hsf_overexpr_vs_control_mRNA.rnk")
+ranklist <- lapply(rankFiles, function(file) {
+  data <- read.table(file = paste0("./ranked_files/", file), skip = 1, stringsAsFactors = FALSE) %>% set_colnames(c("geneName", str_sub(file, 0, -9)))
+})
+ranklist <- Reduce(function(df1, df2) {merge(df1, df2, by="geneName", all=T)}, ranklist)
+ranklist <- ranklist[complete.cases(ranklist),]
+colnames(ranklist)[which(colnames(ranklist) == 'hsf_overexpr_vs_control_', arr.ind = T)] <- "HSFOEvsC"
+
+rrhoMaps <- lapply(2:ncol(ranklist), function(i) {
+  output <- lapply(2:ncol(ranklist), function(j)  {
+    x.list <- ranklist[,c("geneName",colnames(ranklist)[i])]  
+    y.list <- ranklist[,c("geneName",colnames(ranklist)[j])]
+    map <- RRHO(list1=x.list, list2=y.list, stepsize = 50, plots=F, BY=T, log10.ind=T, alternative="two.sided")
+  })  %>% set_names(colnames(ranklist)[2:ncol(ranklist)])
+}) %>% set_names(colnames(ranklist)[2:ncol(ranklist)])
+
+dopePlots <- lapply(1:length(rrhoMaps), function(i) {
+  output <- lapply(1:length(rrhoMaps[[i]]), function(j){
+    rrho <- rrhoMaps[[i]][[j]]
+    x.name <- names(rrhoMaps)[i]
+    y.name <- names(rrhoMaps[[i]])[j]
+    if(i == j) {
+      plot <- rrhoMapPlot(rrho=rrho, noFeatures=T, blank=T, silent=T)      
+    }
+    else {
+      plot <- rrhoMapPlot(rrho=rrho, noFeatures=T, silent=T)    
+    }
+  }) %>% set_names(names(rrhoMaps[[i]]))
+}) %>% set_names(names(rrhoMaps))
+
+png(filename = "./figures/RRHO_maps_mRNAseq/rrho_matrix_multistudy1.png", width = 10, height = 10, units="in", res = 300)
+grid.newpage()
+panels <- arrangeGrob(grobs = unlist(dopePlots, recursive = F), ncol=4, padding=0, respect = T)
+row_lab <- tableGrob(names(dopePlots), theme= ttheme_minimal(core = list(fg_params=list(rot=90))))
+col_lab <- tableGrob(t(c("",names(dopePlots))), theme= ttheme_minimal())
+combined <- gtable_cbind(row_lab, panels, size="last")
+combined <- gtable_rbind(col_lab, combined, size="last")
+grid.draw(combined)
+invisible(dev.off())
+
+```
+
+Selected RRHO maps, color intensities are on the same scale
+
+```{r, fig.height=3, fig.width=9, dpi=300}
+rrhoMap_scale <- c(0,0)
+for(name in names(rrhoMaps$HSFOEvsC)[c(1,2,4)]){
+  scale_max <- max(rrhoMaps$HSFOEvsC[[name]]$hypermat.by[is.finite(rrhoMaps$HSFOEvsC[[name]]$hypermat.by)], na.rm=T)
+  scale_min <- min(rrhoMaps$HSFOEvsC[[name]]$hypermat.by[is.finite(rrhoMaps$HSFOEvsC[[name]]$hypermat.by)], na.rm=T)
+  if(scale_max > rrhoMap_scale[2]) { rrhoMap_scale[2]=scale_max }
+  if(scale_min < rrhoMap_scale[1]) { rrhoMap_scale[1]=scale_min }
+}
+
+plots <- lapply(names(rrhoMaps$HSFOEvsC)[c(1,2,4)], function(name) {
+    rrho <- rrhoMaps$HSFOEvsC[[name]]
+    x.name <- "hsf OE     <=>       ctl"
+    y.name <- name %>% strsplit("vs") %>% unlist() %>% paste0(collapse='    <=>    ')
+    y.name <- strsplit(y.name, "vs")
+    plot <- rrhoMapPlot(rrho=rrho, scale=rrhoMap_scale, noFeatures=F, silent=T, xlab=x.name, ylab= y.name)    
+}) %>% set_names(names(rrhoMaps$HSFOEvsC)[c(1,2,4)])
+
+png(filename = "./figures/RRHO_maps_mRNAseq/rrho_HSF_overexpression_sameScale.png", width = 6, height = 2, units="in", res = 300)
+grid.arrange(grobs=plots, ncol=3, nrow=1)
+invisible(dev.off())
+
+grid.arrange(grobs=plots, ncol=3, nrow=1)
+
+```
+
+Selected RRHO maps, each panel has its own scale of color intensities
+
+```{r, fig.height=3, fig.width=9, dpi=300}
+plots <- lapply(names(rrhoMaps$HSFOEvsC)[c(1,2,4)], function(name) {
+    rrho <- rrhoMaps$HSFOEvsC[[name]]
+    x.name <- "hsf OE     <=>       ctl"
+    y.name <- name %>% strsplit("vs") %>% unlist() %>% paste0(collapse='    <=>    ')
+    y.name <- strsplit(y.name, "vs")
+    plot <- rrhoMapPlot(rrho=rrho, noFeatures=F, silent=T, xlab=x.name, ylab= y.name)    
+    
+}) %>% set_names(names(rrhoMaps$HSFOEvsC)[c(1,2,4)])
+
+png(filename = "./figures/RRHO_maps_mRNAseq/rrho_HSF_overexpression.png", width = 6, height = 2, units="in", res = 300)
+grid.arrange(grobs=plots, ncol=3, nrow=1)
+invisible(dev.off())
+
+grid.arrange(grobs=plots, ncol=3, nrow=1)
+
+```
+
+## Gene Set Enrichment analysis  
+Gene Set Enrichment analysis of mRNA-seq data
+
+```{r prep preranked, message=FALSE, warning=FALSE, cache=TRUE}
+# load data
+rankFiles <- c("C27vsEVmRNA.rnk","E02vsEVmRNA.rnk", "STvsFEmRNA.rnk")
+ranklist <- lapply(rankFiles, function(file) {
+  data <- read.table(file = paste0("./ranked_files/", file), skip = 1, stringsAsFactors = FALSE) %>% set_colnames(c("geneName", str_sub(file, 0, -9)))
+})
+ranklist <- Reduce(function(df1, df2) {merge(df1, df2, by="geneName", all=T)}, ranklist)
+ranklist <- ranklist[complete.cases(ranklist),]
+
+GSEAresults <- list()
+
+# GSEA analysis C27 vs EV
+geneList = ranklist[,2] %>% set_names(ranklist$geneName) %>% sort(., decreasing=TRUE)
+gsea_cc <- gseGO(geneList = geneList, OrgDb = org.Ce.eg.db, keyType = "WORMBASE", ont = "CC", exponent = 0, eps = 1e-100, minGSSize = 5, maxGSSize = 500, pvalueCutoff = 0.05, verbose  = FALSE)
+gsea_bp <- gseGO(geneList = geneList, OrgDb = org.Ce.eg.db, keyType = "WORMBASE", ont = "BP", exponent = 0, eps = 1e-100, minGSSize = 5, maxGSSize = 500, pvalueCutoff = 0.05, verbose  = FALSE)
+gsea_mf <- gseGO(geneList = geneList, OrgDb = org.Ce.eg.db, keyType = "WORMBASE", ont = "MF", exponent = 0, eps = 1e-100, minGSSize = 5, maxGSSize = 500, pvalueCutoff = 0.05, verbose  = FALSE)
+GSEAresults <- append(GSEAresults, list(C27vsEV=list(cc=gsea_cc, bp=gsea_bp, mf=gsea_mf)))
+
+# GSEA analysis E02 vs EV
+geneList = ranklist[,3] %>% set_names(ranklist$geneName) %>% sort(., decreasing=TRUE)
+gsea_cc <- gseGO(geneList = geneList, OrgDb = org.Ce.eg.db, keyType = "WORMBASE", ont = "CC", exponent = 0, eps = 1e-100, minGSSize = 5, maxGSSize = 500, pvalueCutoff = 0.05, verbose  = FALSE)
+gsea_bp <- gseGO(geneList = geneList, OrgDb = org.Ce.eg.db, keyType = "WORMBASE", ont = "BP", exponent = 0, eps = 1e-100, minGSSize = 5, maxGSSize = 500, pvalueCutoff = 0.05, verbose  = FALSE)
+gsea_mf <- gseGO(geneList = geneList, OrgDb = org.Ce.eg.db, keyType = "WORMBASE", ont = "MF", exponent = 0, eps = 1e-100, minGSSize = 5, maxGSSize = 500, pvalueCutoff = 0.05, verbose  = FALSE)
+GSEAresults <- append(GSEAresults, list(E02vsEV=list(cc=gsea_cc, bp=gsea_bp, mf=gsea_mf)))
+
+# GSEA analysis Starved vs Fed
+geneList = ranklist[,4] %>% set_names(ranklist$geneName) %>% sort(., decreasing=TRUE)
+gsea_cc <- gseGO(geneList = geneList, OrgDb = org.Ce.eg.db, keyType = "WORMBASE", ont = "CC", exponent = 0, eps = 1e-100, minGSSize = 5, maxGSSize = 500, pvalueCutoff = 0.05, verbose  = FALSE)
+gsea_bp <- gseGO(geneList = geneList, OrgDb = org.Ce.eg.db, keyType = "WORMBASE", ont = "BP", exponent = 0, eps = 1e-100, minGSSize = 5, maxGSSize = 500, pvalueCutoff = 0.05, verbose  = FALSE)
+gsea_mf <- gseGO(geneList = geneList, OrgDb = org.Ce.eg.db, keyType = "WORMBASE", ont = "MF", exponent = 0, eps = 1e-100, minGSSize = 5, maxGSSize = 500, pvalueCutoff = 0.05, verbose  = FALSE)
+GSEAresults <- append(GSEAresults, list(STvsFE=list(cc=gsea_cc, bp=gsea_bp, mf=gsea_mf)))
+
+#save GSEA results as files
+for (i in names(GSEAresults)) {
+  for (j in names(GSEAresults[[i]])) {
+    enriched_in_control   <- GSEAresults[[i]][[j]]@result[GSEAresults[[i]][[j]]@result$NES < 0, c("ID","p.adjust")] %>% set_rownames(NULL)
+    enriched_in_treatment <- GSEAresults[[i]][[j]]@result[GSEAresults[[i]][[j]]@result$NES > 0, c("ID","p.adjust")] %>% set_rownames(NULL)
+    write.table(enriched_in_control, file=paste0("./go_enrichment_files/", "mRNAseq_", i, "_enriched_in_control_", j, ".txt"), quote=F, sep = "\t", row.names=F)  
+    write.table(enriched_in_treatment, file=paste0("./go_enrichment_files/", "mRNAseq_", i, "_enriched_in_treatment_", j, ".txt"), quote=F, sep = "\t", row.names=F)
+  }
+}
+
+```
+
+Significant gene sets only  
+Note: the sign of ```NES``` column indicates the enrichment direction. NES > 0 means the gene set is enriched in the treatment and NES < 0 in the control.  
+
+### E02 vs EV   {.tabset .tabset-fade .tabset-pills}
+
+#### cellular component {.toc-ignore .tabset .tabset-fade .tabset-pills}
+
+##### Gene sets enriched in the KD {.toc-ignore}
+```{r}
+table <- GSEAresults$E02vsEV$cc@result[GSEAresults$E02vsEV$cc@result$NES > 0, c(1:3,5,7) ] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA cellular components (CC): E02 vs EV ', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+##### Gene sets enriched in the empty vector control {.toc-ignore}
+```{r}
+table <- GSEAresults$E02vsEV$cc@result[GSEAresults$E02vsEV$cc@result$NES < 0, c(1:3,5,7) ] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA cellular components (CC): E02 vs EV ', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+#### {- .toc-ignore}
+
+#### biological process {.toc-ignore .tabset .tabset-fade .tabset-pills}
+
+##### Gene sets enriched in the KD {.toc-ignore}
+```{r}
+table <- GSEAresults$E02vsEV$bp@result[GSEAresults$E02vsEV$bp@result$NES > 0, c(1:3,5,7)] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA biological process (BP): E02 vs EV ', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+##### Gene sets enriched in the empty vector control {.toc-ignore}
+```{r}
+table <- GSEAresults$E02vsEV$bp@result[GSEAresults$E02vsEV$bp@result$NES < 0, c(1:3,5,7) ] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA cellular components (CC): E02 vs EV ', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+#### {- .toc-ignore}
+
+#### molecular function {.toc-ignore .tabset .tabset-fade .tabset-pills}
+
+##### Gene sets enriched in the KD {.toc-ignore}
+```{r}
+table <- GSEAresults$E02vsEV$mf@result[GSEAresults$E02vsEV$mf@result$NES > 0, c(1:3,5,7)] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA molecular function (MF): E02 vs EV ', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+##### Gene sets enriched in the empty vector control {.toc-ignore}
+```{r}
+table <- GSEAresults$E02vsEV$mf@result[GSEAresults$E02vsEV$mf@result$NES < 0, c(1:3,5,7)] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA molecular function (MF): E02 vs EV ', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+#### {- .toc-ignore}
+
+### {- .toc-ignore}
+
+
+### C27 vs EV   {.tabset .tabset-fade .tabset-pills}
+
+#### cellular component {.toc-ignore .tabset .tabset-fade .tabset-pills}
+
+##### Gene sets enriched in the KD {.toc-ignore}
+```{r}
+table <- GSEAresults$C27vsEV$cc@result[GSEAresults$C27vsEV$cc@result$NES > 0, c(1:3,5,7) ] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA cellular components (CC): C27 vs EV ', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+##### Gene sets enriched in the empty vector control {.toc-ignore}
+```{r}
+table <- GSEAresults$C27vsEV$cc@result[GSEAresults$C27vsEV$cc@result$NES < 0, c(1:3,5,7) ] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA cellular components (CC): C27 vs EV ', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+#### {- .toc-ignore}
+
+#### biological process {.toc-ignore .tabset .tabset-fade .tabset-pills}
+
+##### Gene sets enriched in the KD {.toc-ignore}
+```{r}
+table <- GSEAresults$C27vsEV$bp@result[GSEAresults$C27vsEV$bp@result$NES > 0, c(1:3,5,7)] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA biological process (BP): C27 vs EV ', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+##### Gene sets enriched in the empty vector control {.toc-ignore}
+```{r}
+table <- GSEAresults$C27vsEV$bp@result[GSEAresults$C27vsEV$bp@result$NES < 0, c(1:3,5,7) ] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA cellular components (CC): C27 vs EV ', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+#### {- .toc-ignore}
+
+#### molecular function {.toc-ignore .tabset .tabset-fade .tabset-pills}
+
+##### Gene sets enriched in the KD {.toc-ignore}
+```{r}
+table <- GSEAresults$C27vsEV$mf@result[GSEAresults$C27vsEV$mf@result$NES > 0, c(1:3,5,7)] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA molecular function (MF): C27 vs EV ', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+##### Gene sets enriched in the empty vector control {.toc-ignore}
+```{r}
+table <- GSEAresults$C27vsEV$mf@result[GSEAresults$C27vsEV$mf@result$NES < 0, c(1:3,5,7)] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA molecular function (MF): C27 vs EV ', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+#### {- .toc-ignore}
+
+### {- .toc-ignore}
+
+
+### Starved vs Fed   {.tabset .tabset-fade .tabset-pills}
+
+#### cellular component {.toc-ignore .tabset .tabset-fade .tabset-pills}
+
+##### Gene sets enriched in Starved {.toc-ignore}
+```{r}
+table <- GSEAresults$STvsFE$cc@result[GSEAresults$STvsFE$cc@result$NES > 0, c(1:3,5,7) ] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA cellular components (CC): Starved vs Fed', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+##### Gene sets enriched in Fed {.toc-ignore}
+```{r}
+table <- GSEAresults$STvsFE$cc@result[GSEAresults$STvsFE$cc@result$NES < 0, c(1:3,5,7) ] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA cellular components (CC): Starved vs Fed', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+#### {- .toc-ignore}
+
+#### biological process {.toc-ignore .tabset .tabset-fade .tabset-pills}
+
+##### Gene sets enriched in Starved {.toc-ignore}
+```{r}
+table <- GSEAresults$STvsFE$bp@result[GSEAresults$STvsFE$bp@result$NES > 0, c(1:3,5,7)] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA biological process (BP): Starved vs Fed', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+##### Gene sets enriched in Fed {.toc-ignore}
+```{r}
+table <- GSEAresults$STvsFE$bp@result[GSEAresults$STvsFE$bp@result$NES < 0, c(1:3,5,7) ] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA cellular components (CC): Starved vs Fed', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+#### {- .toc-ignore}
+
+#### molecular function {.toc-ignore .tabset .tabset-fade .tabset-pills}
+
+##### Gene sets enriched in Starved {.toc-ignore}
+```{r}
+table <- GSEAresults$STvsFE$mf@result[GSEAresults$STvsFE$mf@result$NES > 0, c(1:3,5,7)] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA molecular function (MF): Starved vs Fed', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+##### Gene sets enriched in Fed {.toc-ignore}
+```{r}
+table <- GSEAresults$STvsFE$mf@result[GSEAresults$STvsFE$mf@result$NES < 0, c(1:3,5,7)] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA molecular function (MF): Starved vs Fed', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+#### {- .toc-ignore}
+
+### {- .toc-ignore}
+
+
+# Translation Efficiency  
+
+```{r load data}
+sampleTable <- read.table(file = "./counts/SampleTable.txt", header = TRUE, sep = "\t", stringsAsFactors = FALSE) 
+subtable <- sampleTable[sampleTable$type == "mrna" & sampleTable$study == 'greer',]
+mrnaCounts <- lapply(1:nrow(subtable), function(x) {
+                data <- read.table(file = paste0("./counts/",  subtable[x,"file"]), skip=4, row.names = 1) %>% select(1) %>% set_colnames(subtable[x,'abbr'])
+                data$geneNames <- row.names(data) %>% str_replace("Gene:","")
+                return(data)
+})
+mrnaCounts <- Reduce(function(df1, df2) {merge(df1, df2, by="geneNames", all=T)}, mrnaCounts)
+row.names(mrnaCounts) <- mrnaCounts$geneNames
+mrnaCounts$geneNames <- NULL
+mrnaCounts <- as.matrix(mrnaCounts) %>% filter_by_count()
+
+subtable <- sampleTable[sampleTable$type == "ribo" & sampleTable$study == 'greer',]
+riboCounts <- lapply(1:nrow(subtable), function(x) {
+                data <- read.table(file = paste0("./counts/",  subtable[x,"file"]), skip=4, row.names = 1) %>% select(1) %>% set_colnames(subtable[x,'abbr'])
+                data$geneNames <- row.names(data) %>% str_replace("Gene:","")
+                return(data)
+})
+riboCounts <- Reduce(function(df1, df2) {merge(df1, df2, by="geneNames", all=T)}, riboCounts)
+row.names(riboCounts) <- riboCounts$geneNames
+riboCounts$geneNames <- NULL
+riboCounts <- as.matrix(riboCounts) %>% filter_by_count()
+
+write.csv(riboCounts, file="ribocounts.csv")
+
+commonGenes <- row.names(mrnaCounts)[row.names(mrnaCounts) %in% row.names(riboCounts)]
+mrnaCounts <- mrnaCounts[commonGenes,]
+riboCounts <- riboCounts[commonGenes,]
+te <- log2((riboCounts + 1) / (mrnaCounts + 1))
+te <- te[!(row.names(te) %in% mtDNA),]
+te <- te[!(row.names(te) %in% histones),]
+
+#te <- scale(te)
+write.csv(te, file="TEvalues.csv")
+```
+
+## Scatter plots  {.tabset .tabset-fade .tabset-pills}  
+### Translation Efficiency  {.toc-ignore}
+
+```{r, fig.align="center", fig.height=8, fig.width=8, dpi=300, warning=FALSE}
+png('./figures/MatrixPlot_translationEfficiency.png', width = 2400, height = 2400, units = 'px', res = 300)
+pairs(te, pch = '.', gap = 0.25, xaxt = "n", yaxt = "n", labels = colnames(te))
+invisible(dev.off())
+pairs(te, pch = '.', gap = 0.25, xaxt = "n", yaxt = "n", labels = colnames(te))
+```
+
+### Ribo-seq data alone  {.toc-ignore} 
+```{r, fig.align="center", fig.height=8, fig.width=8, dpi=300, warning=FALSE}
+png('./figures/MatrixPlot_RiboSeq.png', width = 2400, height = 2400, units = 'px', res = 300)
+pairs(riboCounts, log = "yx", pch = '.', gap = 0.25, xaxt = "n", yaxt = "n", labels = colnames(riboCounts))
+invisible(dev.off())
+pairs(riboCounts, log = "yx", pch = '.', gap = 0.25, xaxt = "n", yaxt = "n", labels = colnames(riboCounts))
+```
+
+## {- .toc-ignore}
+## PCA plots  {.tabset .tabset-fade .tabset-pills}
+### Combined experiments  {.toc-ignore}
+
+```{r PCA plots TE, fig.align="center", fig.height=4, fig.width=4}
+# all mRNAseq samples together
+plotData <- scale(te, center = TRUE, scale = TRUE)
+plotData <- plotData[order(rowVars(plotData), decreasing = TRUE), ] %>% .[1:1000,]
+pca <- prcomp(t(plotData), scale. = TRUE)
+percentVar <- pca$sdev^2/sum(pca$sdev^2)
+PCAsummary <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], group = sampleTable[sampleTable$type == "mrna" & sampleTable$study == 'greer',"treatment"]) 
+
+g <- ggplot(data = PCAsummary, aes_string(x = "PC1", y = "PC2", color = "group")) + 
+        geom_point(size = 3) + 
+        xlab(paste0("PC1: ", round(percentVar[1] * 100), "% variance")) +
+        ylab(paste0("PC2: ", round(percentVar[2] * 100), "% variance")) +
+        theme_bw() +
+        theme(panel.grid = element_blank(), panel.border = element_rect(linetype = "solid", fill = NA, size = 0.75), plot.margin = margin(1,1,1,1,"mm")) +
+        theme(axis.ticks.length = unit(1, "mm"), axis.ticks = element_line(size = 0.5), axis.text = element_text(size = rel(0.75))) +
+        theme(axis.title = element_text(size = rel(0.75)))+
+        theme(legend.text = element_text(size = rel(0.65)), legend.title = element_blank(), legend.key.size = unit(15, "pt"), legend.margin = margin(0,0,0,0,"pt"), legend.box.margin=margin(0,0,0,-10, "pt"))
+
+ggsave(filename="./figures/PCA_TE.pdf", plot=g, device="pdf", units="in", width=4, height=4)
+g
+
+```
+
+### Fed-Starved  {.toc-ignore}
+
+```{r fig.align="center", fig.height=4, fig.width=4}
+# Fed-starved experiment
+plotData <- scale(te[,1:12], center = TRUE, scale = TRUE)
+plotData <- plotData[order(rowVars(plotData), decreasing = TRUE), ] %>% .[1:1000,]
+pca <- prcomp(t(plotData), scale. = TRUE)
+percentVar <- pca$sdev^2/sum(pca$sdev^2)
+PCAsummary <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], group = sampleTable[sampleTable$type == 'mrna' &
+                                                                                 sampleTable$study == 'greer' &
+                                                                                 (sampleTable$treatment == 'Fed' | sampleTable$treatment == 'Starved'),
+                                                                                "treatment"])
+
+g <- ggplot(data = PCAsummary, aes_string(x = "PC1", y = "PC2", color = "group")) + 
+        geom_point(size = 3) + 
+        xlab(paste0("PC1: ", round(percentVar[1] * 100), "% variance")) +
+        ylab(paste0("PC2: ", round(percentVar[2] * 100), "% variance")) +
+        theme_bw() +
+        theme(panel.grid = element_blank(), panel.border = element_rect(linetype = "solid", fill = NA, size = 0.75), plot.margin = margin(1,1,1,1,"mm")) +
+        theme(axis.ticks.length = unit(1, "mm"), axis.ticks = element_line(size = 0.5), axis.text = element_text(size = rel(0.75))) +
+        theme(axis.title = element_text(size = rel(0.75)))+
+        theme(legend.text = element_text(size = rel(0.65)), legend.title = element_blank(), legend.key.size = unit(15, "pt"), legend.margin = margin(0,0,0,0,"pt"), legend.box.margin=margin(0,0,0,-10, "pt"))
+
+ggsave(filename="./figures/PCA_Fed-Starved_TE.pdf", plot=g, device="pdf", units="in", width=4, height=4)
+g
+
+```
+
+### Knockdowns  {.toc-ignore}
+
+```{r fig.align="center", fig.height=4, fig.width=4}
+# knockdowns experiment
+plotData <- scale(te[,13:ncol(te)], center = TRUE, scale = TRUE)
+plotData <- plotData[order(rowVars(plotData), decreasing = TRUE), ] %>% .[1:1000,]
+pca <- prcomp(t(plotData), scale. = TRUE)
+percentVar <- pca$sdev^2/sum(pca$sdev^2)
+PCAsummary <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], group = sampleTable[sampleTable$type == 'mrna' &
+                                                                                 sampleTable$study == 'greer' &
+                                                                                 (sampleTable$treatment == 'RC27' | sampleTable$treatment == 'REV' | sampleTable$treatment == 'RE02'),
+                                                                                "treatment"])
+
+g <- ggplot(data = PCAsummary, aes_string(x = "PC1", y = "PC2", color = "group")) + 
+        geom_point(size = 3) + 
+        xlab(paste0("PC1: ", round(percentVar[1] * 100), "% variance")) +
+        ylab(paste0("PC2: ", round(percentVar[2] * 100), "% variance")) +
+        theme_bw() +
+        theme(panel.grid = element_blank(), panel.border = element_rect(linetype = "solid", fill = NA, size = 0.75), plot.margin = margin(1,1,1,1,"mm")) +
+        theme(axis.ticks.length = unit(1, "mm"), axis.ticks = element_line(size = 0.5), axis.text = element_text(size = rel(0.75))) +
+        theme(axis.title = element_text(size = rel(0.75)))+
+        theme(legend.text = element_text(size = rel(0.65)), legend.title = element_blank(), legend.key.size = unit(15, "pt"), legend.margin = margin(0,0,0,0,"pt"), legend.box.margin=margin(0,0,0,-10, "pt"))
+
+ggsave(filename="./figures/PCA_KDs_TE.pdf", plot=g, device="png", units="in", width=4, height=4)
+g
+
+```
+
+## {- .toc-ignore}
+
+## Differential Gene Expression Analysis
+Differential translation efficiency analysis, preparation of ranked files for GSEA.  
+
+```{r, warning=F, message=F}
+DEresults <- list()
+
+#-------------------------------------- Fed vs Starved -----------------------------------------------------------------
+eset <- te[,1:12] %>% scale(center=TRUE, scale=TRUE) %>% as.matrix()
+design <- cbind(control=c(rep(1,6), rep(0,6)), treatment=c(rep(0,6), rep(1,6)))
+row.names(design) <- colnames(eset)
+fit <- lmFit(eset, design)
+cont.matrix <- makeContrasts(TreatmentvsControl=treatment-control, levels=design)
+fit2 <- contrasts.fit(fit, cont.matrix)
+fit2 <- eBayes(fit2)
+result <- topTable(fit2, coef="TreatmentvsControl", number=Inf, confint=TRUE)
+result$se <- (result$CI.R - result$CI.L)/3.92
+result <- result[c(4,1,9,5,6,7)]
+colnames(result) <- c('baseMean','log2FoldChange','lfcSE','stat','pvalue','padj')
+result$pvalue <- jitter_pval(result$pvalue)
+result$rank <- -sign(result$log2FoldChange) * log10(result$pvalue)
+write.csv(result, file="TE_Starved_vs_Fed.csv")
+DEresults <- append(DEresults, list(STvsFE=result))
+
+#---------------------------------- Empty vector vs siRNA knockdowns -------------------------------------------------
+eset <- te[,13:ncol(te)] %>% scale(center=TRUE, scale=TRUE) %>% as.matrix()
+TS <- factor(c(rep('RC27',4), rep('REV',4), rep('RE02',4)), levels=c("REV","RE02","RC27"))
+design <- model.matrix(~0+TS) %>% set_rownames(colnames(eset)) %>% set_colnames(levels(TS))
+fit <- lmFit(eset, design)
+
+cont.matrix <- makeContrasts(
+  C27_vs_EV = RC27 - REV,
+  E02_vs_EV = RE02 - REV,
+  levels=design
+)
+
+fit2 <- contrasts.fit(fit, cont.matrix)
+fit2 <- eBayes(fit2)
+
+
+# effect of C27 knockdown
+result1 <- topTable(fit2, coef='C27_vs_EV', number=Inf, confint=TRUE)
+result1$se <- (result1$CI.R - result1$CI.L)/3.92
+result1 <- result1[c(4,1,9,5,6,7)]
+colnames(result1) <- c('baseMean','log2FoldChange','lfcSE','stat','pvalue','padj')
+result1$pvalue <- jitter_pval(result1$pvalue)
+result1$rank <- -sign(result1$log2FoldChange) * log10(result1$pvalue)
+write.csv(result1, file="TE_C27_vs_EV.csv")
+DEresults <- append(DEresults, list(C27vsEV=result1))
+
+# effect of E02 knockdown
+result2 <- topTable(fit2, coef='E02_vs_EV', number=Inf, confint=TRUE)
+result2$se <- (result2$CI.R - result2$CI.L)/3.92
+result2 <- result2[c(4,1,9,5,6,7)]
+colnames(result2) <- c('baseMean','log2FoldChange','lfcSE','stat','pvalue','padj')
+result2$pvalue <- jitter_pval(result2$pvalue)
+result2$rank <- -sign(result2$log2FoldChange) * log10(result2$pvalue)
+write.csv(result2, file="TE_E02_vs_EV.csv")
+DEresults <- append(DEresults, list(E02vsEV=result2))
+
+#save rank files
+junk <- lapply(names(DEresults), function(name) {
+  rank <- data.frame(NAME = row.names(DEresults[[name]]), RANK = DEresults[[name]]$rank)
+  rank <- rank[order(rank$RANK),]
+  write.table(rank, file=paste0("./ranked_files/", name, "_TE.rnk"), row.names = F, quote = F, sep = "\t") 
+})
+rm(junk)
+
+```
+
+## Gene Set Enrichment analysis  
+
+```{r, message=FALSE, warning=FALSE, cache=TRUE}
+# load data
+rankFiles <- c("C27vsEV_TE.rnk","E02vsEV_TE.rnk", "STvsFE_TE.rnk")
+ranklist <- lapply(rankFiles, function(file) {
+  data <- read.table(file = paste0("./ranked_files/", file), skip = 1, stringsAsFactors = FALSE) %>% set_colnames(c("geneName", str_sub(file, 0, -9)))
+})
+ranklist <- Reduce(function(df1, df2) {merge(df1, df2, by="geneName", all=T)}, ranklist)
+ranklist <- ranklist[complete.cases(ranklist),]
+
+GSEAresults <- list()
+
+# GSEA analysis C27 vs EV
+geneList = ranklist[,2] %>% set_names(ranklist$geneName) %>% sort(., decreasing=TRUE)
+gsea_cc <- gseGO(geneList = geneList, OrgDb = org.Ce.eg.db, keyType = "WORMBASE", ont = "CC", exponent = 0, eps = 1e-100, minGSSize = 5, maxGSSize = 500, pvalueCutoff = 0.05, verbose  = FALSE)
+gsea_bp <- gseGO(geneList = geneList, OrgDb = org.Ce.eg.db, keyType = "WORMBASE", ont = "BP", exponent = 0, eps = 1e-100, minGSSize = 5, maxGSSize = 500, pvalueCutoff = 0.05, verbose  = FALSE)
+gsea_mf <- gseGO(geneList = geneList, OrgDb = org.Ce.eg.db, keyType = "WORMBASE", ont = "MF", exponent = 0, eps = 1e-100, minGSSize = 5, maxGSSize = 500, pvalueCutoff = 0.05, verbose  = FALSE)
+GSEAresults <- append(GSEAresults, list(C27vsEV=list(cc=gsea_cc, bp=gsea_bp, mf=gsea_mf)))
+
+# GSEA analysis E02 vs EV
+geneList = ranklist[,3] %>% set_names(ranklist$geneName) %>% sort(., decreasing=TRUE)
+gsea_cc <- gseGO(geneList = geneList, OrgDb = org.Ce.eg.db, keyType = "WORMBASE", ont = "CC", exponent = 0, eps = 1e-100, minGSSize = 5, maxGSSize = 500, pvalueCutoff = 0.05, verbose  = FALSE)
+gsea_bp <- gseGO(geneList = geneList, OrgDb = org.Ce.eg.db, keyType = "WORMBASE", ont = "BP", exponent = 0, eps = 1e-100, minGSSize = 5, maxGSSize = 500, pvalueCutoff = 0.05, verbose  = FALSE)
+gsea_mf <- gseGO(geneList = geneList, OrgDb = org.Ce.eg.db, keyType = "WORMBASE", ont = "MF", exponent = 0, eps = 1e-100, minGSSize = 5, maxGSSize = 500, pvalueCutoff = 0.05, verbose  = FALSE)
+GSEAresults <- append(GSEAresults, list(E02vsEV=list(cc=gsea_cc, bp=gsea_bp, mf=gsea_mf)))
+
+# GSEA analysis Starved vs Fed
+geneList = ranklist[,4] %>% set_names(ranklist$geneName) %>% sort(., decreasing=TRUE)
+gsea_cc <- gseGO(geneList = geneList, OrgDb = org.Ce.eg.db, keyType = "WORMBASE", ont = "CC", exponent = 0, eps = 1e-100, minGSSize = 5, maxGSSize = 500, pvalueCutoff = 0.05, verbose  = FALSE)
+gsea_bp <- gseGO(geneList = geneList, OrgDb = org.Ce.eg.db, keyType = "WORMBASE", ont = "BP", exponent = 0, eps = 1e-100, minGSSize = 5, maxGSSize = 500, pvalueCutoff = 0.05, verbose  = FALSE)
+gsea_mf <- gseGO(geneList = geneList, OrgDb = org.Ce.eg.db, keyType = "WORMBASE", ont = "MF", exponent = 0, eps = 1e-100, minGSSize = 5, maxGSSize = 500, pvalueCutoff = 0.05, verbose  = FALSE)
+GSEAresults <- append(GSEAresults, list(STvsFE=list(cc=gsea_cc, bp=gsea_bp, mf=gsea_mf)))
+
+#save GSEA results as files
+for (i in names(GSEAresults)) {
+  for (j in names(GSEAresults[[i]])) {
+    enriched_in_control   <- GSEAresults[[i]][[j]]@result[GSEAresults[[i]][[j]]@result$NES < 0, c("ID","p.adjust")] %>% set_rownames(NULL)
+    enriched_in_treatment <- GSEAresults[[i]][[j]]@result[GSEAresults[[i]][[j]]@result$NES > 0, c("ID","p.adjust")] %>% set_rownames(NULL)
+    write.table(enriched_in_control, file=paste0("./go_enrichment_files/", "TE_", i, "_enriched_in_control_", j, ".txt"), quote=F, sep = "\t", row.names=F)  
+    write.table(enriched_in_treatment, file=paste0("./go_enrichment_files/", "TE_", i, "_enriched_in_treatment_", j, ".txt"), quote=F, sep = "\t", row.names=F)
+  }
+}
+```
+
+Significant gene sets only  
+Note: the sign of ```NES``` column indicates the enrichment direction. NES > 0 means the gene set is enriched in the treatment and NES < 0 in the control.  
+
+
+### E02 vs EV   {.tabset .tabset-fade .tabset-pills}
+
+#### cellular component {.toc-ignore .tabset .tabset-fade .tabset-pills}
+
+##### Gene sets enriched in the KD {.toc-ignore}
+```{r}
+table <- GSEAresults$E02vsEV$cc@result[GSEAresults$E02vsEV$cc@result$NES > 0, c(1:3,5,7) ] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA cellular components (CC): E02 vs EV ', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+##### Gene sets enriched in the empty vector control {.toc-ignore}
+```{r}
+table <- GSEAresults$E02vsEV$cc@result[GSEAresults$E02vsEV$cc@result$NES < 0, c(1:3,5,7) ] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA cellular components (CC): E02 vs EV ', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+#### {- .toc-ignore}
+
+#### biological process {.toc-ignore .tabset .tabset-fade .tabset-pills}
+
+##### Gene sets enriched in the KD {.toc-ignore}
+```{r}
+table <- GSEAresults$E02vsEV$bp@result[GSEAresults$E02vsEV$bp@result$NES > 0, c(1:3,5,7)] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA biological process (BP): E02 vs EV ', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+##### Gene sets enriched in the empty vector control {.toc-ignore}
+```{r}
+table <- GSEAresults$E02vsEV$bp@result[GSEAresults$E02vsEV$bp@result$NES < 0, c(1:3,5,7) ] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA cellular components (CC): E02 vs EV ', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+#### {- .toc-ignore}
+
+#### molecular function {.toc-ignore .tabset .tabset-fade .tabset-pills}
+
+##### Gene sets enriched in the KD {.toc-ignore}
+```{r}
+table <- GSEAresults$E02vsEV$mf@result[GSEAresults$E02vsEV$mf@result$NES > 0, c(1:3,5,7)] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA molecular function (MF): E02 vs EV ', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+##### Gene sets enriched in the empty vector control {.toc-ignore}
+```{r}
+table <- GSEAresults$E02vsEV$mf@result[GSEAresults$E02vsEV$mf@result$NES < 0, c(1:3,5,7)] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA molecular function (MF): E02 vs EV ', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+#### {- .toc-ignore}
+
+### {- .toc-ignore}
+
+
+### C27 vs EV   {.tabset .tabset-fade .tabset-pills}
+
+#### cellular component {.toc-ignore .tabset .tabset-fade .tabset-pills}
+
+##### Gene sets enriched in the KD {.toc-ignore}
+```{r}
+table <- GSEAresults$C27vsEV$cc@result[GSEAresults$C27vsEV$cc@result$NES > 0, c(1:3,5,7) ] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA cellular components (CC): C27 vs EV ', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+##### Gene sets enriched in the empty vector control {.toc-ignore}
+```{r}
+table <- GSEAresults$C27vsEV$cc@result[GSEAresults$C27vsEV$cc@result$NES < 0, c(1:3,5,7) ] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA cellular components (CC): C27 vs EV ', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+#### {- .toc-ignore}
+
+#### biological process {.toc-ignore .tabset .tabset-fade .tabset-pills}
+
+##### Gene sets enriched in the KD {.toc-ignore}
+```{r}
+table <- GSEAresults$C27vsEV$bp@result[GSEAresults$C27vsEV$bp@result$NES > 0, c(1:3,5,7)] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA biological process (BP): C27 vs EV ', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+##### Gene sets enriched in the empty vector control {.toc-ignore}
+```{r}
+table <- GSEAresults$C27vsEV$bp@result[GSEAresults$C27vsEV$bp@result$NES < 0, c(1:3,5,7) ] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA cellular components (CC): C27 vs EV ', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+#### {- .toc-ignore}
+
+#### molecular function {.toc-ignore .tabset .tabset-fade .tabset-pills}
+
+##### Gene sets enriched in the KD {.toc-ignore}
+```{r}
+table <- GSEAresults$C27vsEV$mf@result[GSEAresults$C27vsEV$mf@result$NES > 0, c(1:3,5,7)] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA molecular function (MF): C27 vs EV ', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+##### Gene sets enriched in the empty vector control {.toc-ignore}
+```{r}
+table <- GSEAresults$C27vsEV$mf@result[GSEAresults$C27vsEV$mf@result$NES < 0, c(1:3,5,7)] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA molecular function (MF): C27 vs EV ', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+#### {- .toc-ignore}
+
+### {- .toc-ignore}
+
+
+### Starved vs Fed   {.tabset .tabset-fade .tabset-pills}
+
+#### cellular component {.toc-ignore .tabset .tabset-fade .tabset-pills}
+
+##### Gene sets enriched in Starved {.toc-ignore}
+```{r}
+table <- GSEAresults$STvsFE$cc@result[GSEAresults$STvsFE$cc@result$NES > 0, c(1:3,5,7) ] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA cellular components (CC): Starved vs Fed', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+##### Gene sets enriched in Fed {.toc-ignore}
+```{r}
+table <- GSEAresults$STvsFE$cc@result[GSEAresults$STvsFE$cc@result$NES < 0, c(1:3,5,7) ] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA cellular components (CC): Starved vs Fed', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+#### {- .toc-ignore}
+
+#### biological process {.toc-ignore .tabset .tabset-fade .tabset-pills}
+
+##### Gene sets enriched in Starved {.toc-ignore}
+```{r}
+table <- GSEAresults$STvsFE$bp@result[GSEAresults$STvsFE$bp@result$NES > 0, c(1:3,5,7)] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA biological process (BP): Starved vs Fed', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+##### Gene sets enriched in Fed {.toc-ignore}
+```{r}
+table <- GSEAresults$STvsFE$bp@result[GSEAresults$STvsFE$bp@result$NES < 0, c(1:3,5,7) ] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA cellular components (CC): Starved vs Fed', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+#### {- .toc-ignore}
+
+#### molecular function {.toc-ignore .tabset .tabset-fade .tabset-pills}
+
+##### Gene sets enriched in Starved {.toc-ignore}
+```{r}
+table <- GSEAresults$STvsFE$mf@result[GSEAresults$STvsFE$mf@result$NES > 0, c(1:3,5,7)] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA molecular function (MF): Starved vs Fed', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+##### Gene sets enriched in Fed {.toc-ignore}
+```{r}
+table <- GSEAresults$STvsFE$mf@result[GSEAresults$STvsFE$mf@result$NES < 0, c(1:3,5,7)] %>% set_rownames(NULL)
+datatable(table, options = list(pageLength = 10), caption = 'GSEA molecular function (MF): Starved vs Fed', filter = 'top') %>% formatSignif(columns = c('NES', 'p.adjust'), digits = 3)
+```
+
+#### {- .toc-ignore}
+### {- .toc-ignore}
+
+## Genes Heatmap  {.tabset .tabset-fade .tabset-pills}
+### Combined experiments  {.toc-ignore}
+Only genes that have significant differential expression (p.adj <= 0.05) in at least one condition are displayed on the heatmap (1457 genes).  
+
+```{r, fig.align="center", fig.height=4, fig.width=4}
+colors <- colorRampPalette(c("blue","black","yellow"))(256)
+plotData <- te
+# keep only genes that are significantly DE in at least one condition
+genes2keep <- c()
+for (comparison in names(DEresults)) {
+  df <- DEresults[[comparison]]
+  DE_genes <- df[df$padj <= 0.05,] %>% row.names()
+  genes2keep <- union(genes2keep, DE_genes)
+}
+
+plotData <- plotData[genes2keep,] %>% scale()
+distCol <- t(plotData) %>% dist()
+hclustCol <- hclust(distCol, method = 'complete')  %>% rotate(., order = colnames(plotData))
+
+
+p <- pheatmap(plotData, clustering_distance_rows = 'correlation', clustering_method = "average", scale = 'row', cluster_cols = hclustCol,
+               color = colors,  border_color = NA, show_rownames = FALSE, fontsize = 8, silent = TRUE
+           
+)
+
+png(filename="./figures/TE_heatmap.png", res = 300, height = 4, width = 4, units = 'in')
+p
+invisible(dev.off())
+
+grid.arrange(p$gtable)
+
+```
+
+### Fed-Starved  {.toc-ignore .tabset .tabset-fade .tabset-pills}
+#### Diff expr genes only  {.toc-ignore}
+436 genes  
+```{r, fig.align="center", fig.height=4, fig.width=4}
+colors <- colorRampPalette(c("blue","black","yellow"))(256)
+plotData <- te[,1:12]
+#keep only genes that are significantly DE 
+df <- DEresults$STvsFE
+genes2keep <- df[df$padj <= 0.05,] %>% row.names()
+plotData <- plotData[genes2keep,]
+plotData <- plotData[!(row.names(plotData) %in% mtDNA),]
+plotData <- plotData[!(row.names(plotData) %in% histones),]
+plotData <- scale(plotData)
+distCol <- t(plotData) %>% dist()
+hclustCol <- hclust(distCol, method = 'complete') %>% rotate(., order = colnames(plotData))
+
+p <- pheatmap(plotData, clustering_distance_rows = 'correlation', clustering_method = "average", scale = 'row', cluster_cols = hclustCol,
+               color = colors,  border_color = NA, show_rownames = FALSE, fontsize = 8, silent = TRUE
+           
+)
+
+png(filename="./figures/TE_heatmap_Fed-Starved_DEgenes.png", res = 300, height = 4, width = 4, units = 'in')
+p
+invisible(dev.off())
+
+grid.arrange(p$gtable, newpage = T)
+```
+
+#### All genes  {.toc-ignore}
+
+```{r, fig.align="center", fig.height=4, fig.width=4}
+colors <- colorRampPalette(c("blue","black","yellow"))(256)
+plotData <- te[,1:12]
+plotData <- plotData[!(row.names(plotData) %in% mtDNA),]
+plotData <- plotData[!(row.names(plotData) %in% histones),]
+plotData <- scale(plotData)
+distCol <- t(plotData) %>% dist()
+hclustCol <- hclust(distCol, method = 'complete') %>% rotate(., order = colnames(plotData))
+
+p <- pheatmap(plotData, clustering_distance_rows = 'correlation', clustering_method = "average", scale = 'row', cluster_cols = hclustCol,
+               color = colors,  border_color = NA, show_rownames = FALSE, fontsize = 8, silent = TRUE
+           
+)
+
+png(filename="./figures/TE_heatmap_Fed-Starved_allGenes.png", res = 300, height = 4, width = 4, units = 'in')
+p
+invisible(dev.off())
+
+grid.arrange(p$gtable, newpage = T)
+```
+
+### {- .toc-ignore}
+### Knockdowns  {.toc-ignore .tabset .tabset-fade .tabset-pills}
+#### Diff expr genes only  {.toc-ignore}
+1097 genes  
+```{r, fig.align="center", fig.height=4, fig.width=4}
+colors <- colorRampPalette(c("blue","black","yellow"))(256)
+plotData <- te[,13:ncol(te)]
+#keep only genes that are significantly DE
+genes2keep <- c()
+for (comparison in names(DEresults)[2:3]) {
+  df <- DEresults[[comparison]]
+  DE_genes <- df[df$padj <= 0.05,] %>% row.names()
+  genes2keep <- union(genes2keep, DE_genes)
+}
+
+plotData <- plotData[genes2keep,]
+plotData <- plotData[!(row.names(plotData) %in% mtDNA),]
+plotData <- plotData[!(row.names(plotData) %in% histones),]
+plotData <- scale(plotData)
+distCol <- t(plotData) %>% dist()
+hclustCol <- hclust(distCol, method = 'complete') %>% rotate(., order = colnames(plotData))
+
+p <- pheatmap(plotData, clustering_distance_rows = 'correlation', clustering_method = "average", scale = 'row', cluster_cols = hclustCol,
+               color = colors,  border_color = NA, show_rownames = FALSE, fontsize = 8, silent = TRUE
+           
+)
+
+png(filename="./figures/TE_heatmap_Knockdowns_DEgenes.png", res = 300, height = 4, width = 4, units = 'in')
+p
+invisible(dev.off())
+
+grid.arrange(p$gtable, newpage = T)
+```
+
+#### All genes  {.toc-ignore}
+```{r, fig.align="center", fig.height=4, fig.width=4}
+colors <- colorRampPalette(c("blue","black","yellow"))(256)
+plotData <- te[,13:ncol(te)]
+plotData <- plotData[!(row.names(plotData) %in% mtDNA),]
+plotData <- plotData[!(row.names(plotData) %in% histones),]
+plotData <- scale(plotData)
+distCol <- t(plotData) %>% dist()
+hclustCol <- hclust(distCol, method = 'complete') %>% rotate(., order = colnames(plotData))
+
+p <- pheatmap(plotData, clustering_distance_rows = 'correlation', clustering_method = "average", scale = 'row', cluster_cols = hclustCol,
+               color = colors,  border_color = NA, show_rownames = FALSE, fontsize = 8, silent = TRUE
+           
+)
+
+png(filename="./figures/TE_heatmap_Knockdowns_allGenes.png", res = 300, height = 4, width = 4, units = 'in')
+p
+invisible(dev.off())
+
+grid.arrange(p$gtable, newpage = T)
+```
+
+### {- .toc-ignore}
+## {- .toc-ignore}
+
+## Revigo  {.tabset .tabset-fade .tabset-pills}  
+Two plots: with and w/o labels. Use the plot without labels for publication and add labels manually (using the second plot as a quick reference)  
+
+### Down in KD, Up in Starved [based on mRNAseq]  {.toc-ignore}
+
+```{r, fig.align="center", fig.height=5, fig.width=6, echo=FALSE}
+revigo.names <- c("term_ID","description","frequency_%","plot_X","plot_Y","GO.size","log10.pvalue","uniqueness","dispensability")
+revigo.data <- rbind(c("GO:0000003","reproduction",8.579,-5.509,-2.930,2.908,-3.063,1.000,0.000),
+c("GO:0006412","translation",2.874,-1.503,6.329,2.435,-4.066,0.866,0.000),
+c("GO:0009792","embryo development ending in birth or egg hatching",3.181,3.140,-5.933,2.479,-6.863,0.951,0.000),
+c("GO:0015031","protein transport",4.878,6.092,1.887,2.664,-3.483,0.808,0.000),
+c("GO:0030968","endoplasmic reticulum unfolded protein response",0.594,-1.983,-5.742,1.756,-2.696,0.930,0.008),
+c("GO:0006915","apoptotic process",0.954,-5.950,3.560,1.959,-1.467,0.992,0.008),
+c("GO:0006457","protein folding",1.007,-6.545,0.100,1.982,-2.322,0.992,0.008),
+c("GO:0007005","mitochondrion organization",1.559,6.391,-3.303,2.170,-1.493,0.959,0.008),
+c("GO:0006123","mitochondrial electron transport, cytochrome c to oxygen",0.106,-0.345,-1.477,1.041,-1.081,0.960,0.088),
+c("GO:0040020","regulation of meiotic nuclear division",0.159,-3.239,0.983,1.204,-1.026,0.982,0.097),
+c("GO:0052696","flavonoid glucuronidation",1.865,1.546,7.292,2.246,-1.245,0.888,0.121),
+c("GO:0006898","receptor-mediated endocytosis",0.233,5.977,3.713,1.362,-1.744,0.893,0.296),
+c("GO:0009408","response to heat",0.626,-2.580,-5.413,1.778,-1.161,0.956,0.404),
+c("GO:1902600","proton transmembrane transport",0.817,5.266,2.381,1.892,-3.329,0.866,0.440),
+c("GO:0002119","nematode larval development",3.627,2.574,-6.061,2.535,-3.401,0.951,0.450),
+c("GO:0000398","mRNA splicing, via spliceosome",1.326,-2.798,5.936,2.100,-1.216,0.906,0.520),
+c("GO:0019915","lipid storage",0.361,6.765,1.496,1.544,-1.142,0.847,0.524),
+c("GO:0045039","protein insertion into mitochondrial inner membrane",0.074,6.173,0.180,0.903,-1.438,0.815,0.560),
+c("GO:0009813","flavonoid biosynthetic process",1.865,0.490,6.972,2.246,-1.245,0.858,0.672))
+
+revigo.df <- data.frame(revigo.data, stringsAsFactors = F)
+colnames(revigo.df) <- revigo.names
+revigo.df <- revigo.df[(revigo.df$plot_X != "null" & revigo.df$plot_Y != "null"), ]
+revigo.df[,3:9] <- lapply(revigo.df[,3:9], as.numeric)
+revigo.df <- revigo.df[rev(order(revigo.df$log10.pvalue)),]
+
+p1 <- ggplot(data = revigo.df) +
+  geom_point( aes(plot_X, plot_Y, size = GO.size, fill = log10.pvalue), shape = 21, colour = "black", stroke = 0.25, alpha = 0.75, show.legend = T) +
+  scale_fill_gradientn(colours = c("blue", "cyan", "green", "yellow", "red"), values = c(0,0.2,0.4,0.6,0.8,1.0), trans = 'reverse') +
+  scale_size_area(max_size = 12) +
+  xlim(min(revigo.df$plot_X)-(max(revigo.df$plot_X) - min(revigo.df$plot_X))/10, max(revigo.df$plot_X)+(max(revigo.df$plot_X) - min(revigo.df$plot_X))/10) +
+  ylim(min(revigo.df$plot_Y)-(max(revigo.df$plot_Y) - min(revigo.df$plot_Y))/10, max(revigo.df$plot_Y)+(max(revigo.df$plot_Y) - min(revigo.df$plot_Y))/10) +
+  theme_bw() +
+  theme(panel.grid = element_blank(), axis.text = element_blank(), axis.title = element_blank())
+
+p2 <- ggplot(data = revigo.df) +
+  geom_point( aes(plot_X, plot_Y, size = GO.size, fill = log10.pvalue), shape = 21, colour = "black", stroke = 0.25, alpha = 0.75, show.legend = T) +
+  scale_fill_gradientn(colours = c("blue", "cyan", "green", "yellow", "red"), values = c(0,0.2,0.4,0.6,0.8,1.0), trans = 'reverse') +
+  scale_size_area(max_size = 12) +
+  xlim(min(revigo.df$plot_X)-(max(revigo.df$plot_X) - min(revigo.df$plot_X))/10, max(revigo.df$plot_X)+(max(revigo.df$plot_X) - min(revigo.df$plot_X))/10) +
+  ylim(min(revigo.df$plot_Y)-(max(revigo.df$plot_Y) - min(revigo.df$plot_Y))/10, max(revigo.df$plot_Y)+(max(revigo.df$plot_Y) - min(revigo.df$plot_Y))/10) +
+  geom_text( data = revigo.df, aes(plot_X, plot_Y, label = description), colour = I(alpha("black", 0.85)), size = 3 ) +
+  theme_bw() +
+  theme(panel.grid = element_blank(), axis.text = element_blank(), axis.title = element_blank())
+
+
+ggsave(plot = p1, "./figures/revigo-plot-KDdownUpStarvedmRNAseqBP.pdf",  device="pdf", units='in', width = 6, height = 5) 
+ggsave(plot = p2, "./figures/revigo-plot-KDdownUpStarvedmRNAseqBP_withLabels.pdf",  device="pdf", units='in', width = 6, height = 5)
+p1
+```
+
+### Overlap E02KD with Starvation [TE]  
+
+```{r, fig.align="center", fig.height=5, fig.width=6, echo=F}
+revigo.names <- c("term_ID","description","frequency_%","plot_X","plot_Y","GO.size","log10.pvalue","uniqueness","dispensability")
+revigo.data <- rbind(c("GO:0000003","reproduction",8.579,2.463,-7.275,2.908,-2.326,1.000,0.000),
+c("GO:0006412","translation",2.874,2.212,6.348,2.435,-3.310,0.823,0.000),
+c("GO:0009792","embryo development ending in birth or egg hatching",3.181,6.284,-1.868,2.479,-4.458,0.875,0.000),
+c("GO:0040007","growth",0.498,6.911,3.912,1.681,-1.228,1.000,0.000),
+c("GO:0040011","locomotion",3.786,-6.632,-1.502,2.554,-1.783,1.000,0.000),
+c("GO:0043051","regulation of pharyngeal pumping",0.477,-0.957,1.274,1.663,-1.747,0.914,0.000),
+c("GO:0006898","receptor-mediated endocytosis",0.233,-3.683,-4.720,1.362,-2.245,0.933,0.007),
+c("GO:0006450","regulation of translational fidelity",0.138,-5.790,1.864,1.146,-1.371,0.950,0.066),
+c("GO:0007212","dopamine receptor signaling pathway",0.148,-2.442,6.274,1.176,-1.166,0.950,0.080),
+c("GO:0070588","calcium ion transmembrane transport",0.562,-2.310,-5.654,1.732,-1.972,0.895,0.239),
+c("GO:0033554","cellular response to stress",4.549,-3.279,5.702,2.633,-1.079,0.972,0.249),
+c("GO:0071688","striated muscle myosin thick filament assembly",0.095,5.440,-3.225,1.000,-2.096,0.889,0.271),
+c("GO:0032940","secretion by cell",0.944,-2.483,-4.268,1.954,-1.185,0.927,0.273),
+c("GO:0030163","protein catabolic process",3.436,3.226,5.964,2.512,-2.803,0.837,0.325),
+c("GO:0006508","proteolysis",6.766,2.540,5.596,2.806,-1.304,0.868,0.370),
+c("GO:0006874","cellular calcium ion homeostasis",0.541,-5.788,2.504,1.716,-1.166,0.943,0.384),
+c("GO:0008340","determination of adult lifespan",2.566,5.398,-1.355,2.386,-1.444,0.877,0.428),
+c("GO:0002119","nematode larval development",3.627,6.116,-1.246,2.535,-3.752,0.874,0.450),
+c("GO:0010171","body morphogenesis",0.742,5.349,-2.533,1.851,-1.318,0.877,0.450),
+c("GO:0006816","calcium ion transport",0.626,-1.940,-5.508,1.778,-2.032,0.899,0.675))
+
+revigo.df <- data.frame(revigo.data, stringsAsFactors = F)
+colnames(revigo.df) <- revigo.names
+revigo.df <- revigo.df[(revigo.df$plot_X != "null" & revigo.df$plot_Y != "null"), ]
+revigo.df[,3:9] <- lapply(revigo.df[,3:9], as.numeric)
+revigo.df <- revigo.df[rev(order(revigo.df$log10.pvalue)),]
+
+p1 <- ggplot(data = revigo.df) +
+    geom_point( aes(plot_X, plot_Y, size = GO.size, fill = log10.pvalue), shape = 21, colour = "black", stroke = 0.25, alpha = 0.75, show.legend = T) +
+    scale_fill_gradientn(colours = c("blue", "cyan", "green", "yellow", "red"), values = c(0,0.2,0.4,0.6,0.8,1.0), trans = 'reverse') +
+    scale_size_area(max_size = 12) +
+    xlim(min(revigo.df$plot_X)-(max(revigo.df$plot_X) - min(revigo.df$plot_X))/10, max(revigo.df$plot_X)+(max(revigo.df$plot_X) - min(revigo.df$plot_X))/10) +
+    ylim(min(revigo.df$plot_Y)-(max(revigo.df$plot_Y) - min(revigo.df$plot_Y))/10, max(revigo.df$plot_Y)+(max(revigo.df$plot_Y) - min(revigo.df$plot_Y))/10) +
+    theme_bw() +
+    theme(panel.grid = element_blank(), axis.text = element_blank(), axis.title = element_blank())
+
+p2 <- ggplot(data = revigo.df) +
+    geom_point( aes(plot_X, plot_Y, size = GO.size, fill = log10.pvalue), shape = 21, colour = "black", stroke = 0.25, alpha = 0.75, show.legend = T) +
+    scale_fill_gradientn(colours = c("blue", "cyan", "green", "yellow", "red"), values = c(0,0.2,0.4,0.6,0.8,1.0), trans = 'reverse') +
+    scale_size_area(max_size = 12) +
+    xlim(min(revigo.df$plot_X)-(max(revigo.df$plot_X) - min(revigo.df$plot_X))/10, max(revigo.df$plot_X)+(max(revigo.df$plot_X) - min(revigo.df$plot_X))/10) +
+    ylim(min(revigo.df$plot_Y)-(max(revigo.df$plot_Y) - min(revigo.df$plot_Y))/10, max(revigo.df$plot_Y)+(max(revigo.df$plot_Y) - min(revigo.df$plot_Y))/10) +
+    geom_text(data = revigo.df, aes(plot_X, plot_Y, label = description), colour = I(alpha("black", 0.85)), size = 3 ) +
+    theme_bw() +
+    theme(panel.grid = element_blank(), axis.text = element_blank(), axis.title = element_blank())
+
+ggsave(plot = p1, "./figures/revigo-plot-TEoverlapE02KD+starvation.pdf",  device="pdf", units='in', width = 6, height = 5) 
+ggsave(plot = p2, "./figures/revigo-plot-TEoverlapE02KD+starvation_withLabels.pdf",  device="pdf", units='in', width = 6, height = 5) 
+p1
+```
+
+
+
+
+## {- .toc-ignore}
